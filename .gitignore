@@ -1,0 +1,52 @@
+# 本地密钥与模型配置
+config.yaml
+config.local.yaml
+config.*.local.yaml
+.env
+.env.*
+!.env.example
+
+# 本地提示词设置
+prompts.yaml
+prompts.local.yaml
+prompts.*.local.yaml
+
+# 用户上传、项目运行数据与生成产物
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+projects/*
+!projects/.gitkeep
+
+# 日志、数据库与临时文件
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.tmp
+*.temp
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# IDE 与操作系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 前端依赖与构建缓存
+node_modules/
+dist/
+build/
