@@ -10,9 +10,13 @@
 from __future__ import annotations
 
 import base64
+import contextvars
+import json
 import os
+from datetime import datetime
 from pathlib import Path
 
+import httpx
 import yaml
 from volcenginesdkarkruntime import Ark
 
@@ -33,7 +37,37 @@ class ArkClient:
         if not api_key or api_key.startswith("YOUR_"):
             raise ValueError("请在 config.yaml 或环境变量 ARK_API_KEY 中配置火山方舟 Key")
         base_url = ark_cfg.get("base_url", "https://ark.cn-beijing.volces.com/api/v3")
-        self.client = Ark(api_key=api_key, base_url=base_url)
+        self.base_url = base_url.rstrip("/")
+        self._request_capture = contextvars.ContextVar("ark_request_capture", default=None)
+
+        def capture_wire_request(request: httpx.Request):
+            target = self._request_capture.get()
+            if target is None:
+                return
+            headers = dict(request.headers)
+            for key in list(headers):
+                if key.lower() in {"authorization", "api-key", "x-api-key"}:
+                    headers[key] = "<已隐藏>"
+            raw_body = request.content.decode("utf-8", errors="replace") if request.content else ""
+            try:
+                body = json.loads(raw_body) if raw_body else None
+            except json.JSONDecodeError:
+                body = raw_body
+            target.clear()
+            target.update({
+                "method": request.method,
+                "url": str(request.url),
+                "headers": headers,
+                "body": body,
+                "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "note": "从 HTTP 传输层截获的实际网络请求；鉴权字段已隐藏。",
+            })
+
+        http_client = httpx.Client(
+            timeout=httpx.Timeout(connect=60.0, read=600.0, write=600.0, pool=600.0),
+            event_hooks={"request": [capture_wire_request]},
+        )
+        self.client = Ark(api_key=api_key, base_url=self.base_url, http_client=http_client)
         self.models = self.config.get("models", {})
 
     # ---------- 文本生成 ----------
@@ -45,23 +79,29 @@ class ArkClient:
             raise ValueError(f"文本模型必须配置为 {expected}，当前为 {model or '未配置'}")
         return model
 
-    def chat(self, prompt: str, system: str = "", temperature: float = 0.4) -> str:
-        """调用 doubao-seed-evolving-latest-version 生成文本。"""
+    def chat(self, prompt: str, system: str = "", temperature: float = 0.4,
+             request_capture: dict | None = None) -> str:
+        """调用文本模型，并可将 HTTP 传输层的实际请求写入指定容器。"""
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        resp = self.client.chat.completions.create(
-            model=self._llm_model(),
-            messages=messages,
-            temperature=temperature,
-            extra_body={"thinking": {"type": "disabled"}},
-        )
+        capture_token = self._request_capture.set(request_capture)
+        try:
+            resp = self.client.chat.completions.create(
+                model=self._llm_model(),
+                messages=messages,
+                temperature=temperature,
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+        finally:
+            self._request_capture.reset(capture_token)
         return resp.choices[0].message.content or ""
 
     def chat_stream(self, prompt: str, system: str = "", temperature: float = 0.4,
-                    diagnostics: dict | None = None, json_mode: bool = False):
-        """流式调用文本模型，并将停止原因与 Token 用量写入 diagnostics。"""
+                    diagnostics: dict | None = None, json_mode: bool = False,
+                    request_capture: dict | None = None):
+        """流式调用文本模型，并将停止原因、Token 用量与实际请求写入指定容器。"""
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -76,7 +116,11 @@ class ArkClient:
         }
         if json_mode:
             request_options["response_format"] = {"type": "json_object"}
-        stream = self.client.chat.completions.create(**request_options)
+        capture_token = self._request_capture.set(request_capture)
+        try:
+            stream = self.client.chat.completions.create(**request_options)
+        finally:
+            self._request_capture.reset(capture_token)
         for chunk in stream:
             if diagnostics is not None:
                 diagnostics["response_model"] = getattr(chunk, "model", None) or diagnostics.get("response_model")

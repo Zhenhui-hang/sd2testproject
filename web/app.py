@@ -790,7 +790,42 @@ def smart_match_fragment_assets(name: str, episode: int, fragment_index: int, re
     shot_prompt = req.shot_prompt.strip()
     if not shot_prompt:
         raise HTTPException(400, "当前片段镜头提示词为空")
-    db_path = asset_db.get_db(project_dir(name))
+    project = project_dir(name)
+    script_path = project / "script.txt"
+    episode_context = ""
+    context_episode_numbers = []
+    if script_path.exists():
+        try:
+            script_episodes = doc_parser.split_episodes(script_path.read_text(encoding="utf-8"))
+            nearby_episodes = [
+                item for item in script_episodes
+                if 0 < int(item.get("index", 0)) and abs(int(item.get("index", 0)) - episode) <= 5
+            ]
+            context_episode_numbers = [int(item.get("index", 0)) for item in nearby_episodes]
+            episode_context = "\n\n".join(
+                f"【{'当前集' if int(item.get('index', 0)) == episode else '参考集'}：第{int(item.get('index', 0))}集】\n"
+                f"{str(item.get('content') or '').strip()}"
+                for item in nearby_episodes
+            ).strip()
+        except (OSError, ValueError, TypeError):
+            episode_context = ""
+            context_episode_numbers = []
+    if not episode_context:
+        shots_path = project / "shots.json"
+        if shots_path.exists():
+            try:
+                shots_doc = json.loads(shots_path.read_text(encoding="utf-8"))
+                episode_data = next(
+                    (item for item in shots_doc.get("episodes", []) if int(item.get("episode", 0)) == episode),
+                    None,
+                )
+                if episode_data:
+                    episode_context = f"【当前集：第{episode}集】\n{str(episode_data.get('source') or '').strip()}".strip()
+                    context_episode_numbers = [episode]
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                episode_context = ""
+                context_episode_numbers = []
+    db_path = asset_db.get_db(project)
     assets = asset_db.get_all(db_path)
     candidates = []
     for item in assets:
@@ -800,21 +835,43 @@ def smart_match_fragment_assets(name: str, episode: int, fragment_index: int, re
             "episodes": item.get("episodes") or [], "has_image": bool(item.get("image_path") or item.get("image_url")),
             "description": (item.get("profile") or {}).get("description") or item.get("prompt") or "",
         })
-    default_instruction = """你是影视视频生成资产匹配助手。只根据本片段镜头提示词，精准选择真正会出现在画面中且对视觉一致性有用的资产。不要因为同集出现就选择，不要选择未在本片段出现的资产。
+    default_instruction = """你是影视视频生成资产匹配助手。当前正在处理第 {{CURRENT_EPISODE}} 集。唯一任务是根据【最终视频提示词】判断本片段实际需要哪些资产。
 
-【本片段镜头提示词】
-{{SHOT_PROMPT}}
+【当前集前后各 5 集的剧本上下文（如存在）】
+{{EPISODE_CONTEXT}}
+
+【最终视频提示词（唯一匹配目标）】
+{{FINAL_PROMPT}}
 
 【全部资产库】
 {{ASSETS_JSON}}
+
+判断规则：
+1. 剧本上下文仅用于消歧人物身份、别名、造型阶段、场景位置、道具归属和剧情前后关系；其中已用“当前集”明确标识第 {{CURRENT_EPISODE}} 集。
+2. 最终资产结论必须以最终视频提示词为准，只选择画面中实际出现或明确需要保持视觉一致性的资产；上下文其他集、其他片段出现的资产不得选择。
+3. 同名、别名或多个造型资产冲突时，结合当前集及前后剧情判断；仍无法确定时宁可不选，不要猜测。
+4. 人物资产需匹配当前剧情阶段的正确造型；场景资产需匹配当前实际地点；道具资产需在本片段明确出现或被使用。
 
 只输出合法 JSON：
 {"matches":[{"asset_id":1,"role":"character|scene|prop","mapping_text":"该资产在本片段中对应的具体人物、场景或道具，例如：百姓中说话那个人"}]}
 规则：asset_id 必须来自资产库；role 必须与资产 category 一致；同一资产只能出现一次；mapping_text 简洁准确，不要包含 @资产名。没有需要的资产就返回空 matches。"""
     template = str(analyzer.load_prompt_template("smart_asset_match") or default_instruction)
-    instruction = template.replace("{{SHOT_PROMPT}}", shot_prompt).replace("{{ASSETS_JSON}}", json.dumps(candidates, ensure_ascii=False))
+    instruction = (
+        template.replace("{{CURRENT_EPISODE}}", str(episode))
+        .replace("{{EPISODE_CONTEXT}}", episode_context or f"（第 {episode} 集及前后剧本原文不可用，请仅依据最终视频提示词判断）")
+        .replace("{{EPISODE_SOURCE}}", episode_context or f"（第 {episode} 集及前后剧本原文不可用，请仅依据最终视频提示词判断）")
+        .replace("{{FINAL_PROMPT}}", shot_prompt)
+        .replace("{{SHOT_PROMPT}}", shot_prompt)
+        .replace("{{ASSETS_JSON}}", json.dumps(candidates, ensure_ascii=False))
+    )
+    request_capture: dict[str, Any] = {}
     try:
-        parsed = _extract_json_object(_ark_client().chat(instruction, temperature=0.1))
+        raw_response = _ark_client().chat(
+            instruction,
+            temperature=0.1,
+            request_capture=request_capture,
+        )
+        parsed = _extract_json_object(raw_response)
     except Exception as exc:
         raise HTTPException(502, f"智能匹配资产失败：{exc}") from exc
     by_id = {int(item["id"]): item for item in assets}
@@ -839,7 +896,45 @@ def smart_match_fragment_assets(name: str, episode: int, fragment_index: int, re
         })
     asset_db.set_fragment_assets(db_path, episode, fragment_index, bindings)
     rows = _with_fragment_asset_image_urls(name, db_path, asset_db.get_fragment_assets(db_path, episode, fragment_index))
-    return {"ok": True, "assets": rows, "mapping_text": _fragment_asset_mapping_text(rows)}
+    mapping_text = _fragment_asset_mapping_text(rows)
+    final_prompt = shot_prompt
+    if mapping_text:
+        mapping_section = re.compile(
+            r"\n*【(?:角色|场景|道具)资产映射】：[\s\S]*?(?=\n\s*【(?!(?:角色|场景|道具)资产映射)[^\n]+】|$)"
+        )
+        final_prompt = f"{mapping_section.sub('', shot_prompt).rstrip()}\n\n{mapping_text}".strip()
+
+    prompts_path = project / "seedance_prompts.json"
+    if prompts_path.exists():
+        try:
+            prompts_doc = json.loads(prompts_path.read_text(encoding="utf-8"))
+            matched_prompt = next(
+                (
+                    item for item in prompts_doc.get("prompts", [])
+                    if int(item.get("episode", prompts_doc.get("episode", 0))) == episode
+                    and int(item.get("fragment_index", 0)) == fragment_index
+                ),
+                None,
+            )
+            if matched_prompt is not None:
+                matched_prompt["final_prompt"] = final_prompt
+                prompts_path.write_text(
+                    json.dumps(prompts_doc, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            logger.exception("保存资产匹配后的片段提示词失败")
+
+    return {
+        "ok": True,
+        "episode": episode,
+        "context_episode_numbers": context_episode_numbers,
+        "assets": rows,
+        "mapping_text": mapping_text,
+        "final_prompt": final_prompt,
+        "request": request_capture or None,
+        "raw_response": raw_response,
+    }
 
 
 # ---------------- 步骤触发 ----------------
@@ -1070,11 +1165,25 @@ def _run_split_task(project_name: str, task_id: str) -> None:
         ark = _ark_client()
         model_id = ark._llm_model()
         system_prompt = "你是专业短剧剧本拆解专家，只输出严格 JSON 数组。"
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
         request_info = {
-            "model": model_id, "system": system_prompt, "temperature": 0.2,
-            "episode": episode, "episode_title": title, "source": episode_text,
-            "source_len": len(episode_text), "template": template,
-            "template_len": len(template), "prompt": prompt, "prompt_len": len(prompt),
+            "method": "POST",
+            "url": f"{ark.base_url}/chat/completions",
+            "headers": {
+                "Authorization": "Bearer <已隐藏>",
+                "Content-Type": "application/json",
+            },
+            "body": {
+                "model": model_id,
+                "messages": messages,
+                "temperature": 0.2,
+                "stream": True,
+            },
+            "captured_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "note": "body 与调用 Ark SDK 时实际传入的请求参数一致；仅鉴权密钥已隐藏。",
         }
         _update_split_task(
             project, task_id, stage="等待模型返回", progress=25,
@@ -1407,7 +1516,11 @@ def get_prompts(name: str, episode: int | None = None):
         raise HTTPException(404, "尚未生成提示词")
     doc = json.loads(p.read_text(encoding="utf-8"))
     if episode is not None:
-        prompts = [item for item in doc.get("prompts", []) if int(item.get("episode", 0)) == int(episode)]
+        legacy_episode = int(doc.get("episode", 0) or 0)
+        prompts = [
+            item for item in doc.get("prompts", [])
+            if int(item.get("episode", legacy_episode) or 0) == int(episode)
+        ]
         doc = {**doc, "episode": int(episode), "prompts": prompts}
     return doc
 
@@ -1957,7 +2070,7 @@ def create_video_generation(name: str, body: VideoGenerateIn):
             negative_prompt_seen = True
         prompt_lines.append(line)
     prompt = "\n".join(prompt_lines).strip()
-    duration = max(2, min(int(body.duration or 5), 12))
+    duration = max(2, min(int(body.duration or 5), 15))
     resolution = str(body.resolution or "720p").strip().lower()
     if resolution not in {"480p", "720p", "1080p"}:
         resolution = "720p"
@@ -2240,14 +2353,19 @@ def generate_seedance_stream(name: str, body: SeedanceGenerateIn):
         ark = _ark_client()
         total = len(generation_items)
         seedance_path = d / "seedance_prompts.json"
-        existing_results = []
-        if body.fragment_index is not None and seedance_path.exists():
-            existing_doc = json.loads(seedance_path.read_text(encoding="utf-8"))
-            if int(existing_doc.get("episode", 0)) == body.episode:
-                existing_results = existing_doc.get("prompts", [])
+        existing_doc = json.loads(seedance_path.read_text(encoding="utf-8")) if seedance_path.exists() else {}
+        existing_results = existing_doc.get("prompts", [])
+        other_episode_results = [
+            item for item in existing_results
+            if int(item.get("episode", existing_doc.get("episode", 0)) or 0) != body.episode
+        ]
+        current_episode_results = [
+            item for item in existing_results
+            if int(item.get("episode", existing_doc.get("episode", 0)) or 0) == body.episode
+        ] if body.fragment_index is not None else []
         results_by_index = {
             int(item.get("fragment_index", 0)): item
-            for item in existing_results
+            for item in current_episode_results
             if item.get("fragment_index")
         }
         previous = None
@@ -2264,13 +2382,20 @@ def generate_seedance_stream(name: str, body: SeedanceGenerateIn):
                     template, episode, fragment, fragment_index, target_duration, previous,
                     basic_settings=basic_settings,
                 )
-                yield f"event: request\ndata: {json.dumps({'current': task_index + 1, 'total': total, 'fragment_index': fragment_index + 1, 'label': label, 'system_prompt': system_prompt, 'user_prompt': user_prompt}, ensure_ascii=False)}\n\n"
                 raw_parts = []
                 diagnostics = {}
-                for token in ark.chat_stream(
+                original_request = {}
+                stream = iter(ark.chat_stream(
                     user_prompt, system=system_prompt, temperature=0.2,
                     diagnostics=diagnostics, json_mode=True,
-                ):
+                    request_capture=original_request,
+                ))
+                first_token = next(stream, None)
+                yield f"event: request\ndata: {json.dumps({'current': task_index + 1, 'total': total, 'fragment_index': fragment_index + 1, 'label': label, 'original_request': original_request}, ensure_ascii=False)}\n\n"
+                if first_token is not None:
+                    raw_parts.append(first_token)
+                    yield f"event: response_token\ndata: {json.dumps({'current': task_index + 1, 'fragment_index': fragment_index + 1, 'token': first_token}, ensure_ascii=False)}\n\n"
+                for token in stream:
                     raw_parts.append(token)
                     yield f"event: response_token\ndata: {json.dumps({'current': task_index + 1, 'fragment_index': fragment_index + 1, 'token': token}, ensure_ascii=False)}\n\n"
                 raw = "".join(raw_parts)
@@ -2290,9 +2415,13 @@ def generate_seedance_stream(name: str, body: SeedanceGenerateIn):
                 results_by_index[fragment_index + 1] = item
                 previous = result
                 completed += 1
-                saved_results = [results_by_index[key] for key in sorted(results_by_index)]
+                saved_results = other_episode_results + [results_by_index[key] for key in sorted(results_by_index)]
+                saved_results.sort(key=lambda entry: (
+                    int(entry.get("episode", existing_doc.get("episode", 0)) or 0),
+                    int(entry.get("fragment_index", 0) or 0),
+                ))
                 seedance_path.write_text(
-                    json.dumps({"episode": body.episode, "target_duration": target_duration, "prompts": saved_results}, ensure_ascii=False, indent=2),
+                    json.dumps({"target_duration": target_duration, "prompts": saved_results}, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
                 yield f"event: fragment_done\ndata: {json.dumps({'total': total, 'completed': completed, 'current': task_index + 1, 'fragment_index': fragment_index + 1, 'label': label, 'percent': round(completed / total * 100), 'result': item}, ensure_ascii=False)}\n\n"

@@ -271,6 +271,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
       const [seedanceModalOpen, setSeedanceModalOpen] = useState(false);
       const [seedanceExchanges, setSeedanceExchanges] = useState({});
       const [seedanceExchangeIndex, setSeedanceExchangeIndex] = useState(1);
+      const copySeedanceOriginalRequest = async (request) => {
+        if (!request) return;
+        try {
+          await navigator.clipboard.writeText(JSON.stringify(request, null, 2));
+          message.success('最原始请求已复制');
+        } catch (_) {
+          message.error('复制失败，请手动选择复制');
+        }
+      };
       const [basicSettings, setBasicSettings] = useState(null);
       const [basicSettingsSaving, setBasicSettingsSaving] = useState(false);
       const [visualStyle, setVisualStyle] = useState(null);
@@ -279,8 +288,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
       const api = async (url, opt={}) => {
         const response = await fetch(url, { headers:{'Content-Type':'application/json'}, ...opt });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data?.detail || `请求失败（${response.status}）`);
+        const contentType = response.headers.get('content-type') || '';
+        const raw = await response.text();
+        let data = null;
+        if (raw && contentType.includes('application/json')) {
+          try { data = JSON.parse(raw); } catch (error) { data = null; }
+        }
+        if (!response.ok) {
+          const detail = data?.detail || data?.message;
+          throw new Error(detail || `请求失败（${response.status}）：服务返回了${contentType.includes('text/html') ? '网页而不是 API JSON，请确认后端服务已更新' : '无效响应'}`);
+        }
+        if (!data) throw new Error('服务返回了无效 JSON，请确认后端服务已更新');
         return data;
       };
 
@@ -1251,15 +1269,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
               })}
             </Space>
             {seedanceExchanges[seedanceExchangeIndex] ? <Tabs defaultActiveKey="response" items={[
-              { key:'request', label:'① 请求信息', children:<div>
+              { key:'request', label:'① 最原始请求', children:<div>
                   <Space wrap style={{ marginBottom:10 }}>
                     <Tag>片段 {seedanceExchangeIndex}/{seedanceExchanges[seedanceExchangeIndex].total}</Tag>
                     <Tag color="blue">{seedanceExchanges[seedanceExchangeIndex].label}</Tag>
+                    <Button size="small" onClick={()=>copySeedanceOriginalRequest(seedanceExchanges[seedanceExchangeIndex].original_request)}>复制最原始请求</Button>
                   </Space>
-                  <Paragraph strong>System Prompt</Paragraph>
-                  <pre style={{ whiteSpace:'pre-wrap', wordBreak:'break-word', maxHeight:220, overflow:'auto', background:'#f6f6f6', padding:10 }}>{seedanceExchanges[seedanceExchangeIndex].system_prompt}</pre>
-                  <Paragraph strong>User Prompt</Paragraph>
-                  <pre style={{ whiteSpace:'pre-wrap', wordBreak:'break-word', maxHeight:320, overflow:'auto', background:'#f6f6f6', padding:10 }}>{seedanceExchanges[seedanceExchangeIndex].user_prompt}</pre>
+                  <Alert type="info" showIcon style={{ marginBottom:10 }} message="这是从 HTTP 传输层截获的实际网络请求；鉴权字段已脱敏。" />
+                  <pre style={{ whiteSpace:'pre-wrap', wordBreak:'break-word', maxHeight:540, overflow:'auto', background:'#f6f6f6', padding:10 }}>{JSON.stringify(seedanceExchanges[seedanceExchangeIndex].original_request, null, 2)}</pre>
                 </div> },
               { key:'response', label:'② 实时返回', children:<div>
                   {seedanceExchanges[seedanceExchangeIndex].parseError && <Alert type="error" showIcon style={{ marginBottom:10 }} message="返回内容不是合法 JSON" description={seedanceExchanges[seedanceExchangeIndex].parseError} />}
@@ -1454,6 +1471,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
         succeeded:{color:'success',text:'成功'}, failed:{color:'error',text:'失败'},
       };
       const formatJson = value => value ? JSON.stringify(value, null, 2) : '暂无';
+      const copyJson = async value => {
+        if (!value) return;
+        const text = formatJson(value);
+        try {
+          await navigator.clipboard.writeText(text);
+          message.success('真实请求信息已复制');
+        } catch (error) {
+          message.error('复制失败，请手动选择复制');
+        }
+      };
       const columns = [
         {title:'项目',dataIndex:'project',width:180,ellipsis:true},
         {title:'集数',width:150,render:(_,row)=><Space direction="vertical" size={0}><Text strong>{row.episode_title || `第${row.episode}集`}</Text><Text type="secondary">第 {row.batch_position}/{row.batch_total} 个</Text></Space>},
@@ -1472,8 +1499,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
               <Descriptions.Item label="开始时间">{row.started_at || '-'}</Descriptions.Item><Descriptions.Item label="完成时间">{row.finished_at || '-'}</Descriptions.Item><Descriptions.Item label="总时长">{row.total_seconds ? `${row.total_seconds}秒` : '-'}</Descriptions.Item>
             </Descriptions>
             {!detail ? <Spin tip="正在加载任务详情"/> : <Collapse items={[
-              {key:'request',label:'原始请求',children:<pre style={{whiteSpace:'pre-wrap',wordBreak:'break-word',maxHeight:520,overflow:'auto'}}>{formatJson(detail.request)}</pre>},
-              {key:'response',label:'真实返回',children:<pre style={{whiteSpace:'pre-wrap',wordBreak:'break-word',maxHeight:520,overflow:'auto'}}>{detail.raw_response || '暂无'}</pre>},
+              {key:'request',label:'真实模型请求',children:<div><Alert type="info" showIcon message="以下为服务实际发送给 Ark Chat Completions 的请求；Authorization 已脱敏。" style={{marginBottom:10}}/><Button size="small" onClick={()=>copyJson(detail.request)} style={{marginBottom:10}}>复制真实请求</Button><pre style={{whiteSpace:'pre-wrap',wordBreak:'break-word',maxHeight:520,overflow:'auto'}}>{formatJson(detail.request)}</pre></div>},
+              {key:'response',label:'真实模型返回',children:<pre style={{whiteSpace:'pre-wrap',wordBreak:'break-word',maxHeight:520,overflow:'auto'}}>{detail.raw_response || '暂无'}</pre>},
               {key:'diagnostics',label:'返回诊断',children:<pre style={{whiteSpace:'pre-wrap',wordBreak:'break-word'}}>{formatJson(detail.diagnostics)}</pre>},
               {key:'result',label:'解析结果',children:<pre style={{whiteSpace:'pre-wrap',wordBreak:'break-word',maxHeight:520,overflow:'auto'}}>{formatJson(detail.result)}</pre>},
             ]}/>} 
@@ -1790,9 +1817,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
       };
       const [selected, setSelected] = useState(0);
       const [promptDrafts, setPromptDrafts] = useState({});
+      const [videoDurationDrafts, setVideoDurationDrafts] = useState({});
       const [fragmentAssets, setFragmentAssets] = useState([]);
       const [fragmentAssetsLoading, setFragmentAssetsLoading] = useState(false);
       const [smartMatching, setSmartMatching] = useState(false);
+      const [smartMatchTrace, setSmartMatchTrace] = useState(null);
       const [assetLibraryOpen, setAssetLibraryOpen] = useState(false);
       const [libraryAssetIds, setLibraryAssetIds] = useState([]);
       const [newAssetOpen, setNewAssetOpen] = useState(false);
@@ -1943,8 +1972,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
         try {
           const response = await api(`/api/projects/${encodeURIComponent(project)}/episodes/${currentEpisode}/fragments/${currentFragmentIndex}/assets/smart-match`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({shot_prompt:promptText})});
           setFragmentAssets(response.assets || []);
-          appendAssetMapping(response.mapping_text || '');
-          message.success(`已智能匹配 ${(response.assets||[]).length} 个本片段资产`);
+          setSmartMatchTrace({request:response.request || null,raw_response:response.raw_response || ''});
+          if (response.final_prompt) {
+            updatePrompt(response.final_prompt);
+          } else {
+            appendAssetMapping(response.mapping_text || '');
+          }
+          const contextEpisodes = response.context_episode_numbers || [];
+          const contextLabel = contextEpisodes.length ? `，已参考第 ${contextEpisodes.join('、')} 集` : '';
+          message.success(`第 ${response.episode || currentEpisode} 集已根据最终提示词匹配 ${(response.assets||[]).length} 个资产${contextLabel}`);
         } catch (error) { message.error(error.message || String(error)); }
         finally { setSmartMatching(false); }
       };
@@ -2030,9 +2066,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
         'Seedance 2.0 Fast': 'doubao-seedance-2-0-fast-260128',
         'Seedance 2.0': 'doubao-seedance-2-0-260128',
       }[value] || value);
-      const parseVideoDuration = () => {
+      const parseSystemVideoDuration = () => {
         const matched = String(fragmentTime || '').match(/(\d+(?:\.\d+)?)/);
-        return Math.max(2, Math.min(12, Math.round(matched ? Number(matched[1]) : 5)));
+        return Math.max(2, Math.min(15, Math.round(matched ? Number(matched[1]) : 5)));
+      };
+      const systemVideoDuration = parseSystemVideoDuration();
+      const videoDuration = videoDurationDrafts[currentVideoTaskKey] !== undefined
+        ? videoDurationDrafts[currentVideoTaskKey]
+        : systemVideoDuration;
+      const updateVideoDuration = value => {
+        if (value === null || value === undefined || value === '') return;
+        setVideoDurationDrafts(prev=>({...prev,[currentVideoTaskKey]:Math.max(2,Math.min(15,Math.round(Number(value)||systemVideoDuration)))}));
       };
       const pollVideoTask = async (taskId, taskKey) => {
         window.clearTimeout(videoPollRefs.current[taskKey]);
@@ -2077,7 +2121,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
               model:modelId(model),
               resolution:String(quality || '720P').toLowerCase(),
               ratio:String(ratio || '9:16').split(' ')[0],
-              duration:parseVideoDuration(),
+              duration:videoDuration,
               generate_audio:true,
               watermark:false,
               use_last_frame:videoLastFrameEnabled,
@@ -2087,8 +2131,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
           });
           const task = await response.json();
           if (!response.ok) throw new Error(task.detail || '创建视频任务失败');
+          const submittedDuration = Number(task?.request?.duration);
+          if (submittedDuration && submittedDuration !== Number(videoDuration)) {
+            throw new Error(`视频时长提交异常：设置 ${videoDuration} 秒，后端实际提交 ${submittedDuration} 秒`);
+          }
+          setVideoDurationDrafts(prev=>({...prev,[taskKey]:submittedDuration || videoDuration}));
           setVideoTasks(prev=>({...prev,[taskKey]:task}));
-          message.success('视频生成任务已提交');
+          message.success(`视频生成任务已提交，时长 ${submittedDuration || videoDuration} 秒`);
           pollVideoTask(task.id, taskKey);
         } catch (error) {
           setVideoTasks(prev=>({...prev,[taskKey]:{status:'failed',episode,fragment_index:fragmentIndex,error:{message:error.message}}}));
@@ -2111,6 +2160,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
           .catch(error=>{ if (!cancelled) message.error(error.message); });
         return ()=>{ cancelled = true; };
       }, [project, currentEpisode]);
+      useEffect(()=>{
+        const submittedDuration = Number(videoTask?.request?.duration);
+        if (submittedDuration) {
+          setVideoDurationDrafts(prev=>prev[currentVideoTaskKey] === submittedDuration ? prev : {...prev,[currentVideoTaskKey]:submittedDuration});
+        }
+      }, [currentVideoTaskKey, videoTask?.request?.duration]);
       useEffect(()=>{
         if (previewVideoRef.current) {
           previewVideoRef.current.pause();
@@ -2352,16 +2407,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <div className="video-studio-toolbar-right">
             <Tag>Seedance mini</Tag>
             <Tag>480P</Tag>
-            <Tag>{fragmentTime ? `${fragmentTime}s` : '默认时长'}</Tag>
+            <Tag color="blue">当前设置 {videoDuration}s</Tag>
             <Tag>{ratio}</Tag>
             <Button onClick={onOpenPromptSettings}>设置Seedance生成提示词</Button><Button type="primary" onClick={()=>message.info('请在片段中逐个生成视频')}>合成全集</Button><Button onClick={openQuickCut}>快剪</Button>
           </div>
         </div>
         <div className="video-studio-body">
           <aside className="video-studio-sidebar">
-            <div className="studio-section-title"><span>本片段资产</span><span>{fragmentAssets.length}</span></div>
+            <div className="studio-section-title"><span>本片段资产 · 第 {currentEpisode} 集</span><span>{fragmentAssets.length}</span></div>
+            <Text type="secondary" style={{display:'block',marginBottom:10,fontSize:12}}>智能匹配以最终提示词为准，并参考当前集前后各 5 集（如存在）进行消歧。</Text>
             {currentFragmentIndex > 1 && <div style={{marginBottom:12,padding:10,border:'1px solid #d9d9d9',borderRadius:10,background:'#fafafa'}}><div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,marginBottom:8}}><Text strong>上一片段尾帧</Text><Switch size="small" checked={videoLastFrameEnabled} onChange={setVideoLastFrameEnabled} checkedChildren="开启" unCheckedChildren="关闭" /></div><Space align="start"><div style={{width:64,height:64,borderRadius:8,overflow:'hidden',background:'#eee',display:'flex',alignItems:'center',justifyContent:'center',flex:'0 0 auto',opacity:videoLastFrameEnabled?1:.45}}>{previousLastFrameUrl?<img src={previousLastFrameUrl} alt="上一片段尾帧" style={{width:'100%',height:'100%',objectFit:'cover'}}/>:<Text type="secondary">无尾帧</Text>}</div><div><Text type="secondary">{!videoLastFrameEnabled?'已关闭，生成时不会使用上一片段尾帧':previousLastFrameUrl?'生成时作为临时参考图（不是当前片段首帧），不加入资产库':'上一片段尚无可用尾帧，将仅使用本片段资产'}</Text></div></Space></div>}
-            <Space size={6} wrap style={{marginBottom:12}}><Button size="small" type="primary" loading={smartMatching} onClick={smartMatchAssets}>智能匹配资产</Button><Button size="small" onClick={()=>{setLibraryAssetIds(currentAssetIds);setAssetLibraryOpen(true);}}>从资产库新增</Button><Button size="small" onClick={()=>setNewAssetOpen(true)}>新建资产</Button></Space>
+            <Space size={6} wrap style={{marginBottom:12}}><Button size="small" type="primary" loading={smartMatching} onClick={smartMatchAssets}>根据最终提示词匹配资产</Button><Button size="small" disabled={!smartMatchTrace} onClick={()=>setSmartMatchTrace(trace=>trace?{...trace,open:true}:trace)}>查看请求原文</Button><Button size="small" onClick={()=>{setLibraryAssetIds(currentAssetIds);setAssetLibraryOpen(true);}}>从资产库新增</Button><Button size="small" onClick={()=>setNewAssetOpen(true)}>新建资产</Button></Space>
             <Spin spinning={fragmentAssetsLoading}>
               <div className="studio-fragment-assets">{fragmentAssets.length ? fragmentAssets.map(asset=>{
                 const displayName=fragmentAssetDisplayName(asset);
@@ -2376,6 +2432,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 <Input.TextArea value={promptText} onChange={e=>updatePrompt(e.target.value)} bordered={false} placeholder={list.length ? '输入视频生成提示词' : '该集尚未生成 Seedance 提示词'} />
               </div>
               <div className="studio-prompt-actions">
+                <Space size={6} align="center">
+                  <Text type="secondary">时长</Text>
+                  <InputNumber size="small" min={2} max={15} precision={0} value={videoDuration} onChange={updateVideoDuration} addonAfter="秒" style={{width:108}} />
+                  <Text type="secondary" style={{fontSize:12}}>系统默认 {systemVideoDuration}s，可修改，最多 15s</Text>
+                </Space>
                 <Button size="small" type="link" loading={generatingFragment && activeFragmentIndex === currentFragmentIndex} disabled={!timelineShots[selected] || generatingFragment} onClick={()=>onRegenerateFragment && onRegenerateFragment(currentFragmentIndex)}>重新生成提示词</Button>
                 <Button type="primary" onClick={generateVideo} loading={videoGenerating}>生成视频</Button>
               </div>
@@ -2396,6 +2457,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     <Text type="secondary">{videoGenerating ? `视频任务${videoTask?.status === 'queued' ? '排队中' : '生成中'}，系统正在自动查询结果` : '视频生成后将在这里预览'}</Text>
                   </div>}
             </div>
+            {videoTask?.request?.duration && <Text type="secondary" style={{display:'block',marginTop:8,fontSize:12}}>该任务实际提交：{videoTask.request.duration} 秒{videoTask.duration ? `；平台返回：${videoTask.duration} 秒` : ''}</Text>}
           </aside>
         </div>
         <div className="video-studio-timeline">
@@ -2404,7 +2466,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
             const fragmentIndex = Number(shot?.fragment_index) || index + 1;
             const fragmentTask = videoTasks[`${currentEpisode}:${fragmentIndex}`];
             const thumbnailUrl = fragmentTask?.video_url || fragmentTask?.content?.video_url;
-            return <div className={`studio-timeline-card ${selected===index?'active':''}`} key={`${currentEpisode}-${shot.id || index}`} onClick={()=>setSelected(index)}><div className="studio-timeline-thumb">{thumbnailUrl ? <video src={thumbnailUrl} preload="metadata" muted playsInline /> : <span>{selected===index?'▶':'片段'}</span>}{thumbnailUrl && <div className="studio-timeline-actions"><Tooltip title="生成历史"><button className="studio-timeline-action" aria-label="生成历史" onClick={event=>{event.stopPropagation();openHistory(fragmentIndex);}}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></button></Tooltip><Tooltip title="快剪"><button className="studio-timeline-action" aria-label="快剪" onClick={event=>{event.stopPropagation();openQuickCut(fragmentIndex,fragmentTask);}}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="6" cy="7" r="3"/><circle cx="6" cy="17" r="3"/><path d="m8.7 8.3 10.3 7.2M8.7 15.7 19 8.5"/></svg></button></Tooltip></div>}</div><div className="studio-timeline-label">片段 {String(index+1).padStart(2,'0')} · {shot.time || (shot.duration ? `${shot.duration}s` : '10s')}</div></div>;
+            const submittedDuration = fragmentTask?.request?.duration;
+            return <div className={`studio-timeline-card ${selected===index?'active':''}`} key={`${currentEpisode}-${shot.id || index}`} onClick={()=>setSelected(index)}><div className="studio-timeline-thumb">{thumbnailUrl ? <video src={thumbnailUrl} preload="metadata" muted playsInline /> : <span>{selected===index?'▶':'片段'}</span>}{thumbnailUrl && <div className="studio-timeline-actions"><Tooltip title="生成历史"><button className="studio-timeline-action" aria-label="生成历史" onClick={event=>{event.stopPropagation();openHistory(fragmentIndex);}}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></button></Tooltip><Tooltip title="快剪"><button className="studio-timeline-action" aria-label="快剪" onClick={event=>{event.stopPropagation();openQuickCut(fragmentIndex,fragmentTask);}}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="6" cy="7" r="3"/><circle cx="6" cy="17" r="3"/><path d="m8.7 8.3 10.3 7.2M8.7 15.7 19 8.5"/></svg></button></Tooltip></div>}</div><div className="studio-timeline-label">片段 {String(index+1).padStart(2,'0')} · {submittedDuration ? `${submittedDuration}s` : (shot.time || (shot.duration ? `${shot.duration}s` : '10s'))}</div></div>;
           })}</div>}
         </div>
         <Modal width={620} open={assetLinkOpen} onCancel={()=>setAssetLinkOpen(false)} title={assetLinkAsset ? `${fragmentAssetDisplayName(assetLinkAsset)} · 公网图片与素材 ID` : '更新资产公网图片与素材 ID'} okText="保存并换图" confirmLoading={assetLinkSaving} onOk={saveFragmentAssetLink} okButtonProps={{disabled:!assetLinkUrl.trim()}} destroyOnClose>
@@ -2426,6 +2489,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
             <div><Text strong>{newAssetForm.category==='character'?'造型名称':newAssetForm.category==='scene'?'子场景名称':'道具名称'}</Text><Input style={{marginTop:6}} value={newAssetForm.item_name} onChange={event=>setNewAssetForm(prev=>({...prev,item_name:event.target.value}))} placeholder={newAssetForm.category==='character'?'输入破衣服，自动保存为“人物名-破衣服”':newAssetForm.category==='scene'?'例如：灾荒荒野河畔':'例如：瓷碗'}/></div>
             <div><Text strong>资产图片</Text><Upload.Dragger style={{marginTop:6}} accept="image/png,image/jpeg,image/webp" maxCount={1} beforeUpload={file=>{setNewAssetForm(prev=>({...prev,file}));return false;}} onRemove={()=>setNewAssetForm(prev=>({...prev,file:null}))}><p>点击或拖拽上传图片</p><Text type="secondary">支持 PNG、JPG、WEBP，最大 20MB</Text></Upload.Dragger></div>
           </Space>
+        </Modal>
+        <Modal width={980} open={Boolean(smartMatchTrace?.open)} onCancel={()=>setSmartMatchTrace(trace=>trace?{...trace,open:false}:trace)} destroyOnClose title={`资产自动匹配 · 真实请求原文`} footer={<Space><Button onClick={()=>navigator.clipboard.writeText(JSON.stringify(smartMatchTrace?.request||{},null,2)).then(()=>message.success('真实请求已复制'))}>复制真实请求</Button><Button onClick={()=>navigator.clipboard.writeText(String(smartMatchTrace?.raw_response||'')).then(()=>message.success('模型原始响应已复制'))}>复制原始响应</Button><Button type="primary" onClick={()=>setSmartMatchTrace(trace=>trace?{...trace,open:false}:trace)}>关闭</Button></Space>}>
+          <Alert type="info" showIcon message="以下为资产自动匹配时从 HTTP 传输层截获的实际模型请求，鉴权信息已隐藏。" style={{marginBottom:14}}/>
+          <Tabs items={[{key:'request',label:'真实请求',children:<pre className="raw-json">{JSON.stringify(smartMatchTrace?.request||{},null,2)}</pre>},{key:'response',label:'模型原始响应',children:<pre className="raw-json">{String(smartMatchTrace?.raw_response||'')}</pre>}]} />
         </Modal>
         <Modal width={860} open={sequenceOpen} onCancel={()=>setSequenceOpen(false)} destroyOnClose title={`连续预览 · 第 ${currentEpisode} 集`} footer={null}>
           {currentSequenceVideo ? <div className="sequence-preview">
