@@ -66,8 +66,14 @@ class ArkClient:
         http_client = httpx.Client(
             timeout=httpx.Timeout(connect=60.0, read=600.0, write=600.0, pool=600.0),
             event_hooks={"request": [capture_wire_request]},
+            trust_env=False,
         )
-        self.client = Ark(api_key=api_key, base_url=self.base_url, http_client=http_client)
+        self.client = Ark(
+            api_key=api_key,
+            base_url=self.base_url,
+            http_client=http_client,
+            max_retries=3,
+        )
         self.models = self.config.get("models", {})
 
     # ---------- 文本生成 ----------

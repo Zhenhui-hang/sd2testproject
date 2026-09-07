@@ -1822,6 +1822,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       const [fragmentAssetsLoading, setFragmentAssetsLoading] = useState(false);
       const [smartMatching, setSmartMatching] = useState(false);
       const [smartMatchTrace, setSmartMatchTrace] = useState(null);
+      const [assetMatchProcessOpen, setAssetMatchProcessOpen] = useState(false);
+      const [assetMatchProgress, setAssetMatchProgress] = useState({ percent:0, message:'等待开始…', events:[], output:'' });
       const [assetLibraryOpen, setAssetLibraryOpen] = useState(false);
       const [libraryAssetIds, setLibraryAssetIds] = useState([]);
       const [newAssetOpen, setNewAssetOpen] = useState(false);
@@ -1894,9 +1896,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       }, [sequenceOpen, sequenceIndex, currentSequenceVideo?.videoUrl]);
       const sourcePromptText = (() => {
         if (!item) return '';
+        if (typeof item.final_prompt === 'string' && item.final_prompt) return item.final_prompt;
         if (Array.isArray(result.fragments) && result.fragments.length) return buildFragmentPromptText(result);
         if (typeof result.prompt === 'string' && result.prompt) return result.prompt;
-        if (typeof item.final_prompt === 'string' && item.final_prompt) return item.final_prompt;
         if (item.seedance && typeof item.seedance.prompt === 'string') return item.seedance.prompt;
         return buildFragmentPromptText(result);
       })();
@@ -1969,20 +1971,56 @@ INDEX_HTML = r"""<!DOCTYPE html>
       const smartMatchAssets = async () => {
         if (!promptText.trim()) return message.warning('当前片段镜头提示词为空');
         setSmartMatching(true);
+        setAssetMatchProcessOpen(true);
+        setAssetMatchProgress({ percent:0, message:'正在启动资产匹配…', events:[], output:'' });
         try {
-          const response = await api(`/api/projects/${encodeURIComponent(project)}/episodes/${currentEpisode}/fragments/${currentFragmentIndex}/assets/smart-match`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({shot_prompt:promptText})});
-          setFragmentAssets(response.assets || []);
-          setSmartMatchTrace({request:response.request || null,raw_response:response.raw_response || ''});
-          if (response.final_prompt) {
-            updatePrompt(response.final_prompt);
-          } else {
-            appendAssetMapping(response.mapping_text || '');
+          const response = await fetch(`/api/projects/${encodeURIComponent(project)}/episodes/${currentEpisode}/fragments/${currentFragmentIndex}/assets/smart-match/stream`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({shot_prompt:promptText})});
+          if (!response.ok || !response.body) {
+            const errorData = await response.json().catch(()=>({}));
+            throw new Error(errorData.detail || `请求失败（${response.status}）`);
           }
-          const contextEpisodes = response.context_episode_numbers || [];
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          let finalResponse = null;
+          let streamError = null;
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, {stream:true});
+            const blocks = buffer.split('\n\n');
+            buffer = blocks.pop() || '';
+            blocks.forEach(block => {
+              const event = (block.match(/^event:\s*(.+)$/m) || [])[1] || 'message';
+              const rawData = (block.match(/^data:\s*(.+)$/m) || [])[1];
+              if (!rawData) return;
+              let data = null;
+              try { data = JSON.parse(rawData); } catch (_) { return; }
+              if (event === 'progress') {
+                setAssetMatchProgress(current => ({...current,percent:Number(data.percent)||current.percent,message:data.message||current.message,events:[...current.events,{time:new Date().toLocaleTimeString(),message:data.message||''}]}));
+              } else if (event === 'token') {
+                setAssetMatchProgress(current => ({...current,percent:Math.max(current.percent,45),message:`模型正在返回匹配结果，已接收 ${data.chars||0} 个字符…`,output:current.output+(data.token||'')}));
+              } else if (event === 'done') {
+                finalResponse = data;
+                setAssetMatchProgress(current => ({...current,percent:100,message:data.progress_message||'资产匹配完成',events:[...current.events,{time:new Date().toLocaleTimeString(),message:data.progress_message||'资产匹配完成'}]}));
+              } else if (event === 'error') {
+                streamError = new Error(data.detail || '智能匹配资产失败');
+              }
+            });
+          }
+          if (streamError) throw streamError;
+          if (!finalResponse) throw new Error('资产匹配流已结束，但未返回最终结果');
+          setFragmentAssets(finalResponse.assets || []);
+          setSmartMatchTrace({request:finalResponse.request || null,raw_response:finalResponse.raw_response || ''});
+          if (finalResponse.final_prompt) updatePrompt(finalResponse.final_prompt);
+          else appendAssetMapping(finalResponse.mapping_text || '');
+          const contextEpisodes = finalResponse.context_episode_numbers || [];
           const contextLabel = contextEpisodes.length ? `，已参考第 ${contextEpisodes.join('、')} 集` : '';
-          message.success(`第 ${response.episode || currentEpisode} 集已根据最终提示词匹配 ${(response.assets||[]).length} 个资产${contextLabel}`);
-        } catch (error) { message.error(error.message || String(error)); }
-        finally { setSmartMatching(false); }
+          message.success(`第 ${finalResponse.episode || currentEpisode} 集已根据最终提示词匹配 ${(finalResponse.assets||[]).length} 个资产${contextLabel}`);
+        } catch (error) {
+          setAssetMatchProgress(current => ({...current,message:error.message||String(error),events:[...current.events,{time:new Date().toLocaleTimeString(),message:`失败：${error.message||String(error)}`}]}));
+          message.error(error.message || String(error));
+        } finally { setSmartMatching(false); }
       };
       const removeFragmentAsset = async assetId => {
         const next = fragmentAssets.filter(asset=>Number(asset.id)!==Number(assetId));
@@ -2489,6 +2527,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
             <div><Text strong>{newAssetForm.category==='character'?'造型名称':newAssetForm.category==='scene'?'子场景名称':'道具名称'}</Text><Input style={{marginTop:6}} value={newAssetForm.item_name} onChange={event=>setNewAssetForm(prev=>({...prev,item_name:event.target.value}))} placeholder={newAssetForm.category==='character'?'输入破衣服，自动保存为“人物名-破衣服”':newAssetForm.category==='scene'?'例如：灾荒荒野河畔':'例如：瓷碗'}/></div>
             <div><Text strong>资产图片</Text><Upload.Dragger style={{marginTop:6}} accept="image/png,image/jpeg,image/webp" maxCount={1} beforeUpload={file=>{setNewAssetForm(prev=>({...prev,file}));return false;}} onRemove={()=>setNewAssetForm(prev=>({...prev,file:null}))}><p>点击或拖拽上传图片</p><Text type="secondary">支持 PNG、JPG、WEBP，最大 20MB</Text></Upload.Dragger></div>
           </Space>
+        </Modal>
+        <Modal width={820} open={assetMatchProcessOpen} onCancel={()=>{if(!smartMatching)setAssetMatchProcessOpen(false);}} maskClosable={!smartMatching} closable={!smartMatching} title="资产自动匹配 · 实时请求过程" footer={<Space>{smartMatchTrace?.request&&<Button onClick={()=>setSmartMatchTrace(trace=>({...trace,open:true}))}>查看真实请求原文</Button>}<Button type="primary" disabled={smartMatching} onClick={()=>setAssetMatchProcessOpen(false)}>关闭</Button></Space>}>
+          <Progress percent={Math.round(assetMatchProgress.percent||0)} status={smartMatching?'active':assetMatchProgress.percent>=100?'success':'normal'} />
+          <Alert style={{margin:'14px 0'}} type={assetMatchProgress.percent>=100?'success':'info'} showIcon message={assetMatchProgress.message||'处理中…'} />
+          <div style={{maxHeight:180,overflow:'auto',border:'1px solid #f0f0f0',borderRadius:8,padding:'10px 12px',background:'#fafafa'}}>
+            {assetMatchProgress.events.length ? assetMatchProgress.events.map((event,index)=><div key={index} style={{fontSize:13,lineHeight:1.9}}><Text type="secondary">[{event.time}]</Text> {event.message}</div>) : <Text type="secondary">等待请求开始…</Text>}
+          </div>
+          <div style={{marginTop:14}}><Text strong>模型实时输出</Text><pre className="raw-json" style={{maxHeight:300,marginTop:8}}>{assetMatchProgress.output||'模型返回内容将在这里实时显示…'}</pre></div>
         </Modal>
         <Modal width={980} open={Boolean(smartMatchTrace?.open)} onCancel={()=>setSmartMatchTrace(trace=>trace?{...trace,open:false}:trace)} destroyOnClose title={`资产自动匹配 · 真实请求原文`} footer={<Space><Button onClick={()=>navigator.clipboard.writeText(JSON.stringify(smartMatchTrace?.request||{},null,2)).then(()=>message.success('真实请求已复制'))}>复制真实请求</Button><Button onClick={()=>navigator.clipboard.writeText(String(smartMatchTrace?.raw_response||'')).then(()=>message.success('模型原始响应已复制'))}>复制原始响应</Button><Button type="primary" onClick={()=>setSmartMatchTrace(trace=>trace?{...trace,open:false}:trace)}>关闭</Button></Space>}>
           <Alert type="info" showIcon message="以下为资产自动匹配时从 HTTP 传输层截获的实际模型请求，鉴权信息已隐藏。" style={{marginBottom:14}}/>

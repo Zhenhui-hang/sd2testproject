@@ -12,6 +12,7 @@ import datetime
 import json
 import logging
 import mimetypes
+import queue
 import re
 import shutil
 import sqlite3
@@ -55,6 +56,7 @@ app.mount("/static", StaticFiles(directory=ROOT / "web" / "static"), name="stati
 PROJECTS_DIR = ROOT / "projects"
 SETTINGS_PATH = ROOT / "config.yaml"
 PROMPTS_PATH = ROOT / "prompts.yaml"
+_ark_client_context = threading.local()
 
 
 # ---------------- 工具 ----------------
@@ -71,8 +73,11 @@ def project_dir(name: str) -> Path:
 
 
 def _ark_client() -> ArkClient:
-    # ArkClient 自身会按 config.yaml + 环境变量 ARK_API_KEY 初始化
-    return ArkClient()
+    # 流式任务可在线程内注入同一个客户端，以捕获请求与实时输出。
+    client = getattr(_ark_client_context, "client", None)
+    if client is None:
+        client = ArkClient()
+    return client
 
 
 def _cfg() -> dict:
@@ -769,7 +774,22 @@ def _extract_json_object(raw: str) -> dict:
     return value
 
 
-def _fragment_asset_mapping_text(bindings: list[dict]) -> str:
+def _character_voice_asset(db_path: Path, asset: dict) -> dict | None:
+    """返回角色造型所属的主角色音色资产；群众等无主角色音色时返回空。"""
+    if asset.get("category") != "character":
+        return None
+    parent_id = asset.get("parent_id")
+    voice_asset = asset_db.get_asset(db_path, int(parent_id)) if parent_id else asset
+    if not voice_asset or not str(voice_asset.get("audio_path") or "").strip():
+        return None
+    return voice_asset
+
+
+def _fragment_asset_mapping_text(
+    bindings: list[dict],
+    db_path: Path | None = None,
+    voice_reference_names: dict[int, str] | None = None,
+) -> str:
     sections = []
     labels = {"character": "角色资产映射", "scene": "场景资产映射", "prop": "道具资产映射"}
     for role in ("character", "scene", "prop"):
@@ -779,10 +799,93 @@ def _fragment_asset_mapping_text(bindings: list[dict]) -> str:
                 continue
             name = _asset_display_name(item)
             relation = str(item.get("mapping_text") or name).strip()
-            lines.append(f"@{name} 是{relation}")
+            line = f"@{name} 是{relation}"
+            if role == "character" and db_path is not None:
+                voice_asset = _character_voice_asset(db_path, item)
+                if voice_asset:
+                    voice_name = str(voice_asset.get("audio_name") or voice_asset.get("name") or "角色音色").strip()
+                    reference_name = (voice_reference_names or {}).get(int(voice_asset["id"]), voice_name)
+                    line += f"，音色是@{reference_name}"
+            lines.append(line)
         if lines:
             sections.append(f"【{labels[role]}】：\n" + "\n".join(lines))
     return "\n\n".join(sections)
+
+
+@app.post("/api/projects/{name}/episodes/{episode}/fragments/{fragment_index}/assets/smart-match/stream")
+def smart_match_fragment_assets_stream(name: str, episode: int, fragment_index: int, req: FragmentAssetMatchModel):
+    """流式展示资产匹配的请求准备、模型输出、解析和保存过程。"""
+    event_queue: queue.Queue[tuple[str, dict] | None] = queue.Queue()
+
+    def emit(event: str, data: dict):
+        event_queue.put((event, data))
+
+    def worker():
+        try:
+            emit("progress", {"step": "prepare", "message": "正在读取最终提示词和剧本上下文…", "percent": 8})
+            project = project_dir(name)
+            db_path = asset_db.get_db(project)
+            candidate_count = len(asset_db.get_all(db_path))
+            emit("progress", {"step": "assets", "message": f"已载入 {candidate_count} 个候选资产，正在构造模型请求…", "percent": 22})
+
+            client = ArkClient()
+            _ark_client_context.client = client
+            original_chat = client.chat
+
+            def streaming_chat(prompt: str, system: str = "", temperature: float = 0.4,
+                               json_mode: bool = False, request_capture: dict | None = None):
+                emit("progress", {"step": "request", "message": "真实请求已构造，正在连接火山方舟模型…", "percent": 35})
+                tokens = []
+                token_chars = 0
+                diagnostics = {}
+                for token in client.chat_stream(
+                    prompt,
+                    system=system,
+                    temperature=temperature,
+                    diagnostics=diagnostics,
+                    json_mode=json_mode,
+                    request_capture=request_capture,
+                ):
+                    tokens.append(token)
+                    token_chars += len(token)
+                    emit("token", {"token": token, "chars": token_chars})
+                raw_response = "".join(tokens)
+                client.last_raw_response = raw_response
+                emit("progress", {"step": "response", "message": f"模型响应完成，共 {token_chars} 个字符，正在解析匹配结果…", "percent": 72})
+                return raw_response
+
+            client.chat = streaming_chat
+            try:
+                result = smart_match_fragment_assets(name, episode, fragment_index, req)
+            finally:
+                client.chat = original_chat
+                if hasattr(_ark_client_context, "client"):
+                    del _ark_client_context.client
+            emit("progress", {"step": "save", "message": f"已匹配 {len(result.get('assets') or [])} 个资产，正在保存提示词和资产绑定…", "percent": 90})
+            emit("done", {**result, "progress_message": "资产匹配、音色关联和提示词保存已完成", "percent": 100})
+        except HTTPException as exc:
+            emit("error", {"detail": str(exc.detail), "status_code": exc.status_code})
+        except Exception as exc:
+            logger.exception("流式智能匹配资产失败")
+            emit("error", {"detail": f"智能匹配资产失败：{exc}"})
+        finally:
+            event_queue.put(None)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def event_gen():
+        while True:
+            item = event_queue.get()
+            if item is None:
+                break
+            event, data = item
+            yield f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/projects/{name}/episodes/{episode}/fragments/{fragment_index}/assets/smart-match")
@@ -896,7 +999,7 @@ def smart_match_fragment_assets(name: str, episode: int, fragment_index: int, re
         })
     asset_db.set_fragment_assets(db_path, episode, fragment_index, bindings)
     rows = _with_fragment_asset_image_urls(name, db_path, asset_db.get_fragment_assets(db_path, episode, fragment_index))
-    mapping_text = _fragment_asset_mapping_text(rows)
+    mapping_text = _fragment_asset_mapping_text(rows, db_path)
     final_prompt = shot_prompt
     if mapping_text:
         mapping_section = re.compile(
@@ -905,25 +1008,30 @@ def smart_match_fragment_assets(name: str, episode: int, fragment_index: int, re
         final_prompt = f"{mapping_section.sub('', shot_prompt).rstrip()}\n\n{mapping_text}".strip()
 
     prompts_path = project / "seedance_prompts.json"
-    if prompts_path.exists():
-        try:
-            prompts_doc = json.loads(prompts_path.read_text(encoding="utf-8"))
-            matched_prompt = next(
-                (
-                    item for item in prompts_doc.get("prompts", [])
-                    if int(item.get("episode", prompts_doc.get("episode", 0))) == episode
-                    and int(item.get("fragment_index", 0)) == fragment_index
-                ),
-                None,
-            )
-            if matched_prompt is not None:
-                matched_prompt["final_prompt"] = final_prompt
-                prompts_path.write_text(
-                    json.dumps(prompts_doc, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            logger.exception("保存资产匹配后的片段提示词失败")
+    if not prompts_path.exists():
+        raise HTTPException(404, "未找到 Seedance 提示词文件，资产已匹配但最终提示词无法保存")
+    try:
+        prompts_doc = json.loads(prompts_path.read_text(encoding="utf-8"))
+        matched_prompt = next(
+            (
+                item for item in prompts_doc.get("prompts", [])
+                if int(item.get("episode", prompts_doc.get("episode", 0))) == episode
+                and int(item.get("fragment_index", 0)) == fragment_index
+            ),
+            None,
+        )
+        if matched_prompt is None:
+            raise HTTPException(404, "未找到对应的 Seedance 片段提示词，资产已匹配但最终提示词无法保存")
+        matched_prompt["final_prompt"] = final_prompt
+        prompts_path.write_text(
+            json.dumps(prompts_doc, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except HTTPException:
+        raise
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        logger.exception("保存资产匹配后的片段提示词失败")
+        raise HTTPException(500, "资产已匹配，但最终提示词保存失败") from exc
 
     return {
         "ok": True,
@@ -1772,7 +1880,11 @@ def _character_audio_references(project: Path, asset_ids: list[int]) -> list[dic
             "asset_id": primary_id,
             "name": primary.get("name") or primary.get("key") or f"人物{primary_id}",
             "audio_name": primary.get("audio_name") or path.name,
-            "content": {"type": "audio_url", "audio_url": {"url": data_url}},
+            "content": {
+                "type": "audio_url",
+                "audio_url": {"url": data_url},
+                "role": "reference_audio",
+            },
         })
         seen.add(primary_id)
     if len(references) > 1:
@@ -2082,9 +2194,26 @@ def create_video_generation(name: str, body: VideoGenerateIn):
     requested_ids = {int(value) for value in body.asset_ids}
     if requested_ids:
         bound_assets = [item for item in bound_assets if int(item["id"]) in requested_ids]
-    mapping_text = _fragment_asset_mapping_text(bound_assets)
-    if mapping_text and mapping_text not in prompt:
-        prompt = f"{prompt.rstrip()}\n\n{mapping_text}"
+    matched_character_ids = [
+        int(item["id"])
+        for item in bound_assets
+        if item.get("category") == "character"
+    ]
+    audio_references = _character_audio_references(
+        project,
+        list(dict.fromkeys([*matched_character_ids, *[int(value) for value in body.character_asset_ids]])),
+    )
+    voice_reference_names = {
+        int(item["asset_id"]): f"音频{index}"
+        for index, item in enumerate(audio_references, start=1)
+    }
+    mapping_text = _fragment_asset_mapping_text(bound_assets, db_path, voice_reference_names)
+    mapping_section = re.compile(
+        r"\n*【(?:角色|场景|道具)资产映射】：[\s\S]*?(?=\n\s*【(?!(?:角色|场景|道具)资产映射)[^\n]+】|$)"
+    )
+    prompt = mapping_section.sub("", prompt).rstrip()
+    if mapping_text:
+        prompt = f"{prompt}\n\n{mapping_text}"
     continuity_frame = (
         _latest_previous_fragment_last_frame(project, body.episode, body.fragment_index)
         if body.use_last_frame
@@ -2140,7 +2269,6 @@ def create_video_generation(name: str, body: VideoGenerateIn):
         ]
         prompt = re.sub(r"\n*【参考图片对应关系】：[\s\S]*$", "", prompt).rstrip()
         prompt = f"{prompt}\n\n【参考图片对应关系】：\n" + "\n".join(reference_lines)
-    audio_references = _character_audio_references(project, body.character_asset_ids)
     reference_content = [item["content"] for item in image_references] + [item["content"] for item in audio_references]
     request_content = [{"type": "text", "text": prompt}, *reference_content]
     try:
